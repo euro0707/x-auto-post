@@ -1,0 +1,55 @@
+# Google Apps Script
+.clasp.json
+.claspignore
+
+# 環境変数・設定ファイル（機密情報）
+.env
+.env.local
+.env.*.local
+config.json
+credentials.json
+secrets.json
+
+# API認証情報
+**/api-keys.json
+**/tokens.json
+**/*-credentials.json
+
+# スクリプトプロパティのバックアップ
+script-properties.json
+properties.json
+
+# ログファイル
+*.log
+logs/
+*.log.*
+
+# OS生成ファイル
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# エディタ設定
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node.js（将来的な拡張用）
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# テスト用の一時ファイル
+test-data.json
+temp/
+tmp/
+
+# バックアップファイル
+*.backup
+*.bak
+*.old
