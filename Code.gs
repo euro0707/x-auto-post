@@ -4,12 +4,13 @@
  *
  * シート構成（ヘッダーは任意）:
  *   A列: 投稿本文
- *   B列: 日にち（1900/01/01 を 1 とするシリアル値）
- *   C列: 時（0〜23 の数値、空欄は 0 時扱い）
- *   D列: 分（0〜59 の数値、空欄は 0 分扱い）
- *   E列: 投稿URL（投稿完了時にツイートURLを格納）
- *   F列: スレッドグループID（同じIDを持つ行を連続投稿してスレッド化、空欄は単独投稿）
- *   G列: ステータス（pending/posting/posted/failed）
+ *   B列: noteリンク（任意、投稿後にリプライとして投稿される）
+ *   C列: 日にち（1900/01/01 を 1 とするシリアル値）
+ *   D列: 時（0〜23 の数値、空欄は 0 時扱い）
+ *   E列: 分（0〜59 の数値、空欄は 0 分扱い）
+ *   F列: 投稿URL（投稿完了時にツイートURLを格納）
+ *   G列: スレッドグループID（同じIDを持つ行を連続投稿してスレッド化、空欄は単独投稿）
+ *   H列: ステータス（pending/posting/posted/failed）
  *
  * 必須スクリプトプロパティ:
  *   X_API_KEY
@@ -19,22 +20,24 @@
  *   （いずれも X API v2 ユーザーコンテキストで投稿権限を持つ値）
  *
  * 想定運用フロー:
- * 1. 上記フォーマットでシートへ投稿候補を入力し、C・D 列は空欄のままにする。
- * 2. スレッド投稿したい場合は、F列に同じIDを入力する（例: thread001）
- * 3. 定期実行トリガーなどで postNextScheduledToX() を呼び出す。
- * 4. 実行ごとに期限を過ぎた未投稿行を先頭から探し、スレッドグループ全体を投稿・記録する。
+ * 1. 上記フォーマットでシートへ投稿候補を入力し、D・E 列は空欄のままにする。
+ * 2. B列にnoteのURLを入力すると、投稿後に自動的にリプライとして投稿される（任意）
+ * 3. スレッド投稿したい場合は、G列に同じIDを入力する（例: thread001）
+ * 4. 定期実行トリガーなどで postNextScheduledToX() を呼び出す。
+ * 5. 実行ごとに期限を過ぎた未投稿行を先頭から探し、スレッドグループ全体を投稿・記録する。
  */
 const CONFIG = Object.freeze({
   sheetName: 'sheet',
   dataStartRow: 2,
   columns: Object.freeze({
     content: 1,
-    day: 2,
-    hour: 3,
-    minute: 4,
-    postedUrl: 5,
-    threadGroupId: 6,
-    status: 7
+    noteUrl: 2,
+    day: 3,
+    hour: 4,
+    minute: 5,
+    postedUrl: 6,
+    threadGroupId: 7,
+    status: 8
   }),
   api: Object.freeze({
     tweetEndpoint: 'https://api.twitter.com/2/tweets'
@@ -282,7 +285,7 @@ function postNextScheduledToX() {
  * 単一行を投稿します（スレッドではない通常投稿）
  */
 function postSingleRow_(sheet, target, credentials) {
-  const { rowNumber, content } = target;
+  const { rowNumber, content, noteUrl } = target;
 
   if (!content) {
     console.warn(`行 ${rowNumber} の本文が空欄のためスキップしました。`);
@@ -317,10 +320,22 @@ function postSingleRow_(sheet, target, credentials) {
   }
 
   try {
+    // メイン投稿
     const result = postSingleTweet_(content, null, credentials);
     sheet.getRange(rowNumber, CONFIG.columns.postedUrl).setValue(result.tweetUrl);
     setRowStatus_(sheet, rowNumber, CONFIG.statuses.posted, '');
     console.log(`行 ${rowNumber} を投稿しました: ${result.tweetUrl}`);
+
+    // noteURLがある場合はリプライとして投稿
+    if (noteUrl) {
+      try {
+        console.log(`行 ${rowNumber} のnoteURLをリプライとして投稿中...`);
+        const noteResult = postSingleTweet_(noteUrl, result.tweetId, credentials);
+        console.log(`noteURLリプライを投稿しました: ${noteResult.tweetUrl}`);
+      } catch (noteError) {
+        console.warn(`noteURLリプライの投稿に失敗しましたが、メイン投稿は成功しています: ${noteError}`);
+      }
+    }
   } catch (error) {
     console.error(`行 ${rowNumber} の投稿に失敗しました: ${error}`);
     setRowStatus_(sheet, rowNumber, CONFIG.statuses.failed, String(error));
@@ -332,7 +347,7 @@ function postSingleRow_(sheet, target, credentials) {
  * スレッドグループを投稿します（同じスレッドグループIDを持つすべての行を連続投稿）
  */
 function postThreadGroup_(sheet, firstTarget, credentials) {
-  const { threadGroupId } = firstTarget;
+  const { threadGroupId, noteUrl } = firstTarget;
 
   // 同じスレッドグループIDを持つすべての未投稿行を取得
   const threadRows = findThreadGroupRows_(sheet, threadGroupId);
@@ -405,6 +420,18 @@ function postThreadGroup_(sheet, firstTarget, credentials) {
   }
 
   console.log(`スレッドグループ "${threadGroupId}" の投稿完了（${results.length}件成功）`);
+
+  // スレッド完了後、noteURLがある場合は最後のツイートにリプライ
+  if (noteUrl && previousTweetId) {
+    try {
+      console.log(`スレッドグループのnoteURLをリプライとして投稿中...`);
+      Utilities.sleep(1000); // API制限対策
+      const noteResult = postSingleTweet_(noteUrl, previousTweetId, credentials);
+      console.log(`noteURLリプライを投稿しました: ${noteResult.tweetUrl}`);
+    } catch (noteError) {
+      console.warn(`noteURLリプライの投稿に失敗しましたが、スレッド投稿は成功しています: ${noteError}`);
+    }
+  }
 }
 
 /**
@@ -481,6 +508,38 @@ function findThreadGroupRows_(sheet, threadGroupId) {
   return threadRows;
 }
 
+/**
+ * セルからハイパーリンクの実際のURLを取得します
+ * @param {Sheet} sheet - シート
+ * @param {number} rowNumber - 行番号
+ * @param {number} columnNumber - 列番号
+ * @return {string} - 実際のURL（ハイパーリンクがない場合はセルの値）
+ */
+function extractUrlFromCell_(sheet, rowNumber, columnNumber) {
+  const cell = sheet.getRange(rowNumber, columnNumber);
+
+  // まずリッチテキストから取得を試みる
+  const richText = cell.getRichTextValue();
+  if (richText) {
+    const linkUrl = richText.getLinkUrl();
+    if (linkUrl) {
+      return linkUrl;
+    }
+  }
+
+  // 数式からHYPERLINK関数を検出
+  const formula = cell.getFormula();
+  if (formula) {
+    const match = formula.match(/=HYPERLINK\("([^"]+)"/i);
+    if (match && match[1]) {
+      return match[1];
+    }
+  }
+
+  // どちらでもない場合は通常の値を返す
+  return String(cell.getValue() || '').trim();
+}
+
 function findNextPublishableRow_(sheet) {
   const lastRow = sheet.getLastRow();
   if (lastRow < CONFIG.dataStartRow) {
@@ -501,6 +560,7 @@ function findNextPublishableRow_(sheet) {
     const rowNumber = CONFIG.dataStartRow + index;
     const row = values[index];
     const content = String(row[CONFIG.columns.content - 1] || '').trim();
+    const noteUrl = extractUrlFromCell_(sheet, rowNumber, CONFIG.columns.noteUrl);
     const dayValue = row[CONFIG.columns.day - 1];
     const hourValue = row[CONFIG.columns.hour - 1];
     const minuteValue = row[CONFIG.columns.minute - 1];
@@ -620,6 +680,7 @@ function findNextPublishableRow_(sheet) {
     return {
       rowNumber,
       content,
+      noteUrl: noteUrl || null,
       scheduledAt,
       threadGroupId: threadGroupId || null
     };
@@ -790,7 +851,7 @@ function groupSelectedRowsAsThread() {
   // 一意のスレッドグループIDを生成
   const threadGroupId = generateThreadGroupId_();
 
-  // 選択範囲のF列（threadGroupId列）に同じIDを設定
+  // 選択範囲のG列（threadGroupId列）に同じIDを設定
   const threadIdRange = sheet.getRange(startRow, CONFIG.columns.threadGroupId, numRows, 1);
   const values = [];
   for (let i = 0; i < numRows; i++) {
@@ -832,7 +893,7 @@ function clearThreadIdFromSelection() {
     return;
   }
 
-  // F列（threadGroupId列）をクリア
+  // G列（threadGroupId列）をクリア
   const threadIdRange = sheet.getRange(startRow, CONFIG.columns.threadGroupId, numRows, 1);
   threadIdRange.clearContent();
 
