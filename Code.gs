@@ -4,13 +4,14 @@
  *
  * シート構成（ヘッダーは任意）:
  *   A列: 投稿本文
- *   B列: noteリンク（任意、投稿後にリプライとして投稿される）
- *   C列: 日にち（1900/01/01 を 1 とするシリアル値）
- *   D列: 時（0〜23 の数値、空欄は 0 時扱い）
- *   E列: 分（0〜59 の数値、空欄は 0 分扱い）
- *   F列: 投稿URL（投稿完了時にツイートURLを格納）
- *   G列: スレッドグループID（同じIDを持つ行を連続投稿してスレッド化、空欄は単独投稿）
- *   H列: ステータス（pending/posting/posted/failed）
+ *   B列: 文字数（自動計算、Twitter仕様）
+ *   C列: noteリンク（任意、投稿後にリプライとして投稿される）
+ *   D列: 日にち（1900/01/01 を 1 とするシリアル値）
+ *   E列: 時（0〜23 の数値、空欄は 0 時扱い）
+ *   F列: 分（0〜59 の数値、空欄は 0 分扱い）
+ *   G列: 投稿URL（投稿完了時にツイートURLを格納）
+ *   H列: スレッドグループID（同じIDを持つ行を連続投稿してスレッド化、空欄は単独投稿）
+ *   I列: ステータス（pending/posting/posted/failed）
  *
  * 必須スクリプトプロパティ:
  *   X_API_KEY
@@ -20,9 +21,9 @@
  *   （いずれも X API v2 ユーザーコンテキストで投稿権限を持つ値）
  *
  * 想定運用フロー:
- * 1. 上記フォーマットでシートへ投稿候補を入力し、D・E 列は空欄のままにする。
- * 2. B列にnoteのURLを入力すると、投稿後に自動的にリプライとして投稿される（任意）
- * 3. スレッド投稿したい場合は、G列に同じIDを入力する（例: thread001）
+ * 1. 上記フォーマットでシートへ投稿候補を入力し、E・F 列は空欄のままにする。
+ * 2. C列にnoteのURLを入力すると、投稿後に自動的にリプライとして投稿される（任意）
+ * 3. スレッド投稿したい場合は、H列に同じIDを入力する（例: thread001）
  * 4. 定期実行トリガーなどで postNextScheduledToX() を呼び出す。
  * 5. 実行ごとに期限を過ぎた未投稿行を先頭から探し、スレッドグループ全体を投稿・記録する。
  */
@@ -31,13 +32,14 @@ const CONFIG = Object.freeze({
   dataStartRow: 2,
   columns: Object.freeze({
     content: 1,
-    noteUrl: 2,
-    day: 3,
-    hour: 4,
-    minute: 5,
-    postedUrl: 6,
-    threadGroupId: 7,
-    status: 8
+    charCount: 2,      // 文字数（新規追加）
+    noteUrl: 3,        // noteリンク（B列→C列へ移動）
+    day: 4,            // 日にち（C列→D列へ移動）
+    hour: 5,           // 時（D列→E列へ移動）
+    minute: 6,         // 分（E列→F列へ移動）
+    postedUrl: 7,      // 投稿URL（F列→G列へ移動）
+    threadGroupId: 8,  // スレッドグループID（G列→H列へ移動）
+    status: 9          // ステータス（H列→I列へ移動）
   }),
   api: Object.freeze({
     tweetEndpoint: 'https://api.twitter.com/2/tweets'
@@ -808,9 +810,13 @@ function checkAllCharacterCounts() {
  */
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
-  ui.createMenu('スレッド機能')
+  ui.createMenu('X自動投稿')
     .addItem('選択行を1つのスレッドにまとめる', 'groupSelectedRowsAsThread')
     .addItem('スレッドIDをクリア', 'clearThreadIdFromSelection')
+    .addSeparator()
+    .addItem('文字数を更新', 'updateCharacterCounts')
+    .addSeparator()
+    .addItem('【初回のみ】文字数列を挿入', 'insertCharCountColumn')
     .addToUi();
 }
 
@@ -835,16 +841,31 @@ function groupSelectedRowsAsThread() {
 
   const startRow = selection.getRow();
   const numRows = selection.getNumRows();
+  const endRow = startRow + numRows - 1;
 
-  // ヘッダー行は除外
+  // デバッグログ追加
+  console.log(`選択範囲: 行${startRow}〜${endRow}（${numRows}行）`);
+
+  // ヘッダー行を含む場合は調整
+  let actualStartRow = startRow;
+  let actualNumRows = numRows;
+
   if (startRow < CONFIG.dataStartRow) {
-    SpreadsheetApp.getUi().alert(`データ行（${CONFIG.dataStartRow}行目以降）を選択してください。`);
-    return;
+    // 選択範囲がヘッダー行を含む場合、データ行のみを対象にする
+    actualStartRow = CONFIG.dataStartRow;
+    actualNumRows = endRow - CONFIG.dataStartRow + 1;
+
+    if (actualNumRows <= 0) {
+      SpreadsheetApp.getUi().alert(`データ行（${CONFIG.dataStartRow}行目以降）を選択してください。`);
+      return;
+    }
   }
 
   // 最低2行以上選択されているかチェック
-  if (numRows < 2) {
-    SpreadsheetApp.getUi().alert('スレッドを作成するには2行以上選択してください。');
+  if (actualNumRows < 2) {
+    SpreadsheetApp.getUi().alert(
+      `スレッドを作成するには2行以上選択してください。\n（現在: ${actualNumRows}行のデータ行が選択されています）`
+    );
     return;
   }
 
@@ -852,18 +873,18 @@ function groupSelectedRowsAsThread() {
   const threadGroupId = generateThreadGroupId_();
 
   // 選択範囲のG列（threadGroupId列）に同じIDを設定
-  const threadIdRange = sheet.getRange(startRow, CONFIG.columns.threadGroupId, numRows, 1);
+  const threadIdRange = sheet.getRange(actualStartRow, CONFIG.columns.threadGroupId, actualNumRows, 1);
   const values = [];
-  for (let i = 0; i < numRows; i++) {
+  for (let i = 0; i < actualNumRows; i++) {
     values.push([threadGroupId]);
   }
   threadIdRange.setValues(values);
 
   SpreadsheetApp.getUi().alert(
-    `${numRows}行をスレッドグループ化しました。\nスレッドID: ${threadGroupId}`
+    `${actualNumRows}行をスレッドグループ化しました。\nスレッドID: ${threadGroupId}`
   );
 
-  console.log(`スレッドグループ作成: ${threadGroupId}（行${startRow}〜${startRow + numRows - 1}）`);
+  console.log(`スレッドグループ作成: ${threadGroupId}（行${actualStartRow}〜${actualStartRow + actualNumRows - 1}）`);
 }
 
 /**
@@ -886,20 +907,33 @@ function clearThreadIdFromSelection() {
 
   const startRow = selection.getRow();
   const numRows = selection.getNumRows();
+  const endRow = startRow + numRows - 1;
 
-  // ヘッダー行は除外
+  // デバッグログ追加
+  console.log(`選択範囲: 行${startRow}〜${endRow}（${numRows}行）`);
+
+  // ヘッダー行を含む場合は調整
+  let actualStartRow = startRow;
+  let actualNumRows = numRows;
+
   if (startRow < CONFIG.dataStartRow) {
-    SpreadsheetApp.getUi().alert(`データ行（${CONFIG.dataStartRow}行目以降）を選択してください。`);
-    return;
+    // 選択範囲がヘッダー行を含む場合、データ行のみを対象にする
+    actualStartRow = CONFIG.dataStartRow;
+    actualNumRows = endRow - CONFIG.dataStartRow + 1;
+
+    if (actualNumRows <= 0) {
+      SpreadsheetApp.getUi().alert(`データ行（${CONFIG.dataStartRow}行目以降）を選択してください。`);
+      return;
+    }
   }
 
   // G列（threadGroupId列）をクリア
-  const threadIdRange = sheet.getRange(startRow, CONFIG.columns.threadGroupId, numRows, 1);
+  const threadIdRange = sheet.getRange(actualStartRow, CONFIG.columns.threadGroupId, actualNumRows, 1);
   threadIdRange.clearContent();
 
-  SpreadsheetApp.getUi().alert(`${numRows}行のスレッドIDをクリアしました。`);
+  SpreadsheetApp.getUi().alert(`${actualNumRows}行のスレッドIDをクリアしました。`);
 
-  console.log(`スレッドIDクリア: 行${startRow}〜${startRow + numRows - 1}`);
+  console.log(`スレッドIDクリア: 行${actualStartRow}〜${actualStartRow + actualNumRows - 1}`);
 }
 
 /**
@@ -946,4 +980,165 @@ function generateThreadGroupId_() {
   // 次の番号を生成（3桁でゼロパディング）
   const nextNumber = (maxNumber + 1).toString().padStart(3, '0');
   return `${prefix}${nextNumber}`;
+}
+
+/**
+ * シートにB列（文字数列）を挿入する初回セットアップ関数
+ * 既存データがある場合は、B列以降を1列右にシフトします。
+ *
+ * 【重要】この関数は一度だけ実行してください。
+ * 実行後は、既存のB〜H列がC〜I列に移動します。
+ */
+function insertCharCountColumn() {
+  const sheet = getTargetSheet_();
+
+  // B列の後ろに新しい列を挿入（既存のB列がC列になる）
+  sheet.insertColumnAfter(1);
+
+  // B1にヘッダーを設定
+  sheet.getRange(1, 2).setValue('文字数');
+
+  SpreadsheetApp.getUi().alert(
+    'B列（文字数列）を挿入しました。\n' +
+    '既存のデータは1列右にシフトされています。\n\n' +
+    '次に「文字数を更新」を実行してください。'
+  );
+
+  console.log('B列（文字数列）を挿入しました。');
+}
+
+/**
+ * 全行の文字数を計算してB列に表示します
+ * A列に投稿本文がある行のみ処理します
+ */
+function updateCharacterCounts() {
+  const sheet = getTargetSheet_();
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < CONFIG.dataStartRow) {
+    SpreadsheetApp.getUi().alert('データが存在しません。');
+    return;
+  }
+
+  const rowCount = lastRow - CONFIG.dataStartRow + 1;
+
+  // A列（投稿本文）を取得
+  const contentRange = sheet.getRange(CONFIG.dataStartRow, CONFIG.columns.content, rowCount, 1);
+  const contentValues = contentRange.getValues();
+
+  // B列（文字数）に設定する値を準備
+  const charCountValues = [];
+
+  for (let i = 0; i < contentValues.length; i++) {
+    const content = String(contentValues[i][0] || '').trim();
+
+    if (content) {
+      const charCount = countTwitterCharacters_(content);
+      charCountValues.push([charCount]);
+    } else {
+      charCountValues.push(['']);
+    }
+  }
+
+  // B列に一括で設定
+  const charCountRange = sheet.getRange(CONFIG.dataStartRow, CONFIG.columns.charCount, rowCount, 1);
+  charCountRange.setValues(charCountValues);
+
+  // 文字数列を中央揃えに設定
+  charCountRange.setHorizontalAlignment('center');
+
+  // 制限超過している行に色を付ける（オプション）
+  if (CONFIG.characterLimit.enabled) {
+    const maxLength = CONFIG.planLimits[CONFIG.characterLimit.plan];
+
+    for (let i = 0; i < charCountValues.length; i++) {
+      const charCount = charCountValues[i][0];
+      const rowNumber = CONFIG.dataStartRow + i;
+      const cell = sheet.getRange(rowNumber, CONFIG.columns.charCount);
+
+      if (charCount && charCount > maxLength) {
+        // 文字数超過の場合は赤背景
+        cell.setBackground('#ffcccc');
+        cell.setFontColor('#cc0000');
+      } else if (charCount) {
+        // 正常な場合は背景をクリア
+        cell.setBackground(null);
+        cell.setFontColor(null);
+      }
+    }
+  }
+
+  SpreadsheetApp.getUi().alert(`${rowCount}行の文字数を更新しました。`);
+  console.log(`${rowCount}行の文字数を更新しました。`);
+}
+
+/**
+ * セルが編集されたときに自動実行される関数
+ * A列（投稿本文）が編集されたら、自動的にB列（文字数）を更新します
+ */
+function onEdit(e) {
+  // イベントオブジェクトがない場合は処理しない
+  if (!e || !e.range) {
+    return;
+  }
+
+  const sheet = e.range.getSheet();
+
+  // 対象シートでない場合は処理しない
+  if (sheet.getName() !== CONFIG.sheetName) {
+    return;
+  }
+
+  const editedRow = e.range.getRow();
+  const editedColumn = e.range.getColumn();
+
+  // ヘッダー行は処理しない
+  if (editedRow < CONFIG.dataStartRow) {
+    return;
+  }
+
+  // A列（投稿本文）が編集された場合のみ処理
+  if (editedColumn === CONFIG.columns.content) {
+    updateSingleRowCharCount_(sheet, editedRow);
+  }
+}
+
+/**
+ * 指定された行の文字数を更新します
+ * @param {Sheet} sheet - 対象シート
+ * @param {number} rowNumber - 行番号
+ */
+function updateSingleRowCharCount_(sheet, rowNumber) {
+  const contentCell = sheet.getRange(rowNumber, CONFIG.columns.content);
+  const content = String(contentCell.getValue() || '').trim();
+
+  const charCountCell = sheet.getRange(rowNumber, CONFIG.columns.charCount);
+
+  if (!content) {
+    // 本文が空の場合は文字数もクリア
+    charCountCell.setValue('');
+    charCountCell.setBackground(null);
+    charCountCell.setFontColor(null);
+    return;
+  }
+
+  // 文字数を計算
+  const charCount = countTwitterCharacters_(content);
+  charCountCell.setValue(charCount);
+  charCountCell.setHorizontalAlignment('center');
+
+  // 文字数超過チェック
+  if (CONFIG.characterLimit.enabled) {
+    const maxLength = CONFIG.planLimits[CONFIG.characterLimit.plan];
+
+    if (charCount > maxLength) {
+      // 文字数超過の場合は赤背景
+      charCountCell.setBackground('#ffcccc');
+      charCountCell.setFontColor('#cc0000');
+    } else {
+      // 正常な場合は背景をクリア
+      charCountCell.setBackground(null);
+      charCountCell.setFontColor(null);
+    }
+  }
 }
