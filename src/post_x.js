@@ -615,6 +615,67 @@ function getTweetEngagement_(tweetId, credentials) {
 }
 
 /**
+ * エンゲージメント更新処理の共通ロジック
+ * @param {Sheet} sheet - スプレッドシート
+ * @param {Array} targetRows - 対象ツイートの配列
+ * @param {Object} credentials - API認証情報
+ * @return {Object} - { successCount: number, failCount: number }
+ * @private
+ */
+function processEngagementUpdates_(sheet, targetRows, credentials) {
+  let successCount = 0;
+  let failCount = 0;
+  const batchSize = CONFIG.engagement.batchSize;
+  const sleepMs = CONFIG.engagement.sleepBetweenRequests;
+
+  for (let i = 0; i < targetRows.length; i++) {
+    const target = targetRows[i];
+
+    try {
+      const engagement = getTweetEngagement_(target.tweetId, credentials);
+
+      // スプレッドシートに書き込み
+      const row = target.rowNumber;
+      sheet.getRange(row, CONFIG.columns.likeCount).setValue(engagement.like_count);
+      sheet.getRange(row, CONFIG.columns.retweetCount).setValue(engagement.retweet_count);
+      sheet.getRange(row, CONFIG.columns.replyCount).setValue(engagement.reply_count);
+      sheet.getRange(row, CONFIG.columns.quoteCount).setValue(engagement.quote_count);
+
+      if (engagement.impression_count !== null) {
+        sheet.getRange(row, CONFIG.columns.impressionCount).setValue(engagement.impression_count);
+      }
+      if (engagement.bookmark_count !== null) {
+        sheet.getRange(row, CONFIG.columns.bookmarkCount).setValue(engagement.bookmark_count);
+      }
+
+      sheet.getRange(row, CONFIG.columns.lastUpdated).setValue(new Date());
+      successCount++;
+
+      if (sleepMs > 0 && i < targetRows.length - 1) {
+        Utilities.sleep(sleepMs);
+      }
+
+      if ((i + 1) % batchSize === 0) {
+        console.log(`進捗: ${i + 1}/${targetRows.length} 件完了`);
+      }
+
+    } catch (error) {
+      console.error(`エラー（行${target.rowNumber}, URL: ${target.postedUrl}）: ${error.message}`);
+      failCount++;
+
+      if (CONFIG.engagement.retryOnRateLimit && error.message.includes('429')) {
+        console.log('レート制限に達しました。60秒待機してリトライします...');
+        Utilities.sleep(60000);
+        i--;
+        continue;
+      }
+    }
+  }
+
+  return { successCount, failCount };
+}
+
+/**
  * 投稿済みツイートのエンゲージメント指標を一括更新します。
  *
  * @param {number} daysBack - 何日前までのツイートを対象とするか（デフォルト: CONFIG.engagement.daysBack）
@@ -675,64 +736,10 @@ function updateAllEngagementMetrics(daysBack) {
     return;
   }
 
-  // エンゲージメント取得処理
-  let successCount = 0;
-  let failCount = 0;
-  const batchSize = CONFIG.engagement.batchSize;
-  const sleepMs = CONFIG.engagement.sleepBetweenRequests;
-
   SpreadsheetApp.getUi().alert(`${targetRows.length}件のツイートのエンゲージメントを取得します。\nしばらくお待ちください...`);
 
-  for (let i = 0; i < targetRows.length; i++) {
-    const target = targetRows[i];
-
-    try {
-      // エンゲージメント取得
-      const engagement = getTweetEngagement_(target.tweetId, credentials);
-
-      // スプレッドシートに書き込み
-      const row = target.rowNumber;
-      sheet.getRange(row, CONFIG.columns.likeCount).setValue(engagement.like_count);
-      sheet.getRange(row, CONFIG.columns.retweetCount).setValue(engagement.retweet_count);
-      sheet.getRange(row, CONFIG.columns.replyCount).setValue(engagement.reply_count);
-      sheet.getRange(row, CONFIG.columns.quoteCount).setValue(engagement.quote_count);
-
-      // 有料指標（プランに応じて）
-      if (engagement.impression_count !== null) {
-        sheet.getRange(row, CONFIG.columns.impressionCount).setValue(engagement.impression_count);
-      }
-      if (engagement.bookmark_count !== null) {
-        sheet.getRange(row, CONFIG.columns.bookmarkCount).setValue(engagement.bookmark_count);
-      }
-
-      // 最終更新日時
-      sheet.getRange(row, CONFIG.columns.lastUpdated).setValue(new Date());
-
-      successCount++;
-
-      // レート制限対策：一定間隔でスリープ
-      if (CONFIG.engagement.sleepBetweenRequests > 0 && i < targetRows.length - 1) {
-        Utilities.sleep(sleepMs);
-      }
-
-      // バッチごとに進捗表示
-      if ((i + 1) % batchSize === 0) {
-        Logger.log(`進捗: ${i + 1}/${targetRows.length} 件完了`);
-      }
-
-    } catch (error) {
-      Logger.log(`エラー（行${target.rowNumber}, URL: ${target.postedUrl}）: ${error.message}`);
-      failCount++;
-
-      // レート制限エラーの場合は待機後リトライ
-      if (CONFIG.engagement.retryOnRateLimit && error.message.includes('429')) {
-        Logger.log('レート制限に達しました。60秒待機してリトライします...');
-        Utilities.sleep(60000);
-        i--;  // 同じツイートをリトライ
-        continue;
-      }
-    }
-  }
+  // 共通関数を使用してエンゲージメント更新
+  const { successCount, failCount } = processEngagementUpdates_(sheet, targetRows, credentials);
 
   // 結果報告
   const message = `エンゲージメント更新が完了しました。\n\n` +
@@ -817,56 +824,8 @@ function dailyEngagementUpdate() {
 
     console.log(`${targetRows.length}件のツイートのエンゲージメントを取得します。`);
 
-    // エンゲージメント取得処理
-    let successCount = 0;
-    let failCount = 0;
-    const sleepMs = CONFIG.engagement.sleepBetweenRequests;
-
-    for (let i = 0; i < targetRows.length; i++) {
-      const target = targetRows[i];
-
-      try {
-        const engagement = getTweetEngagement_(target.tweetId, credentials);
-
-        // スプレッドシートに書き込み
-        const row = target.rowNumber;
-        sheet.getRange(row, CONFIG.columns.likeCount).setValue(engagement.like_count);
-        sheet.getRange(row, CONFIG.columns.retweetCount).setValue(engagement.retweet_count);
-        sheet.getRange(row, CONFIG.columns.replyCount).setValue(engagement.reply_count);
-        sheet.getRange(row, CONFIG.columns.quoteCount).setValue(engagement.quote_count);
-
-        if (engagement.impression_count !== null) {
-          sheet.getRange(row, CONFIG.columns.impressionCount).setValue(engagement.impression_count);
-        }
-        if (engagement.bookmark_count !== null) {
-          sheet.getRange(row, CONFIG.columns.bookmarkCount).setValue(engagement.bookmark_count);
-        }
-
-        sheet.getRange(row, CONFIG.columns.lastUpdated).setValue(new Date());
-        successCount++;
-
-        if (sleepMs > 0 && i < targetRows.length - 1) {
-          Utilities.sleep(sleepMs);
-        }
-
-        // 進捗ログ（100件ごと）
-        if ((i + 1) % 100 === 0) {
-          console.log(`進捗: ${i + 1}/${targetRows.length} 件完了`);
-        }
-
-      } catch (error) {
-        console.error(`エラー（行${target.rowNumber}, URL: ${target.postedUrl}）: ${error.message}`);
-        failCount++;
-
-        // レート制限エラーの場合は待機後リトライ
-        if (CONFIG.engagement.retryOnRateLimit && error.message.includes('429')) {
-          console.log('レート制限に達しました。60秒待機してリトライします...');
-          Utilities.sleep(60000);
-          i--;
-          continue;
-        }
-      }
-    }
+    // 共通関数を使用してエンゲージメント更新
+    const { successCount, failCount } = processEngagementUpdates_(sheet, targetRows, credentials);
 
     console.log(`=== エンゲージメント更新完了 ===`);
     console.log(`成功: ${successCount}件`);
