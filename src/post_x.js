@@ -107,11 +107,11 @@ const CONFIG = Object.freeze({
 
   // エンゲージメント取得設定
   engagement: Object.freeze({
-    enabled: true,              // エンゲージメント取得機能全体のON/OFF
+    enabled: false,             // エンゲージメント取得機能全体のON/OFF（無料プランでは制限のため無効化）
     daysBack: 7,                // 更新対象期間（日数）
     batchSize: 100,             // 一度に処理する件数（API制限対策）
-    retryOnRateLimit: true,     // Rate Limit時にリトライするか
-    sleepBetweenRequests: 100   // リクエスト間のスリープ時間（ミリ秒）
+    retryOnRateLimit: false,    // Rate Limit時にリトライするか（15分待つ必要があるためfalse推奨）
+    sleepBetweenRequests: 1000  // リクエスト間のスリープ時間（ミリ秒）※1秒間隔に変更
   }),
   // 実行制御設定
   execution: Object.freeze({
@@ -146,6 +146,30 @@ function getXPlanConfig() {
       characterLimit: preset.characterLimit,
       canAccessPremiumMetrics: preset.canAccessPremiumMetrics
     }
+  };
+}
+
+/**
+ * スクリプトプロパティからX API認証情報を取得します
+ * @return {Object} - { apiKey, apiSecret, accessToken, accessTokenSecret }
+ */
+function getCredentials_() {
+  const props = PropertiesService.getScriptProperties();
+
+  const apiKey = props.getProperty('X_API_KEY');
+  const apiSecret = props.getProperty('X_API_SECRET');
+  const accessToken = props.getProperty('X_ACCESS_TOKEN');
+  const accessTokenSecret = props.getProperty('X_ACCESS_TOKEN_SECRET');
+
+  if (!apiKey || !apiSecret || !accessToken || !accessTokenSecret) {
+    throw new Error('スクリプトプロパティにX API認証情報が設定されていません。X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRETを設定してください。');
+  }
+
+  return {
+    apiKey: apiKey,
+    apiSecret: apiSecret,
+    accessToken: accessToken,
+    accessTokenSecret: accessTokenSecret
   };
 }
 
@@ -312,14 +336,56 @@ function countTwitterCharacters_(text) {
 function getImagesFromCell_(sheet, rowNumber, columnNumber) {
   const images = [];
 
+  // 0. セル内に直接挿入された画像（CellImage）を取得
+  try {
+    const cell = sheet.getRange(rowNumber, columnNumber);
+    const value = cell.getValue();
+    
+    // CellImageオブジェクトのチェック（getContentUrlメソッドの有無で判定）
+    if (value && typeof value.getContentUrl === 'function') {
+      const imageUrl = value.getContentUrl();
+      if (imageUrl) {
+        // 内部URLから画像をフェッチしてBlobを取得
+        const blob = UrlFetchApp.fetch(imageUrl).getBlob();
+        if (blob) {
+          images.push(blob);
+          console.log(
+            `行${rowNumber}: セル内画像(CellImage/getContentUrl)を取得しました (${blob.getBytes().length} bytes, ${blob.getContentType()})`
+          );
+        }
+      }
+    } 
+    // 古い形式や互換性のため getBlob も一応チェック（通常はCellImageには存在しない）
+    else if (value && typeof value.getBlob === 'function') {
+      const blob = value.getBlob();
+      if (blob) {
+        images.push(blob);
+        console.log(
+          `行${rowNumber}: セル内画像(CellImage/getBlob)を取得しました (${blob.getBytes().length} bytes, ${blob.getContentType()})`
+        );
+      }
+    }
+  } catch (error) {
+    console.warn(`行${rowNumber}: セル内画像(CellImage)の取得に失敗しました: ${error}`);
+  }
+
+  if (images.length >= 4) {
+    return images.slice(0, 4);
+  }
+
   // 1. セル内に貼り付けられた画像を取得（OverGridImage）
   const allImages = sheet.getImages();
+  console.log(`行 ${rowNumber}, 列 ${columnNumber}: シート内の画像総数: ${allImages.length}`);
+
   for (let i = 0; i < allImages.length; i++) {
     const img = allImages[i];
     const anchorRow = img.getAnchorRow();
     const anchorCol = img.getAnchorColumn();
 
+    console.log(`  画像 ${i}: anchorRow=${anchorRow}, anchorCol=${anchorCol}, rowOffset=${img.getAnchorRowOffset()}, colOffset=${img.getAnchorColumnOffset()}`);
+
     // 指定した行・列にある画像を収集（複数対応）
+    // anchorRowは1始まり、rowNumberも1始まりなので直接比較
     if (anchorRow === rowNumber && anchorCol === columnNumber) {
       try {
         // 元の画像形式を保持してBlobを取得
@@ -339,9 +405,46 @@ function getImagesFromCell_(sheet, rowNumber, columnNumber) {
     }
   }
 
-  // 2. セルの値がURLの場合（画像がまだない場合のみ）
+  // デバッグ：セル範囲の画像も検索してみる（範囲内の画像を探す）
+  if (images.length === 0 && allImages.length > 0) {
+    console.log(`行 ${rowNumber} のセルに直接アンカーされた画像が見つかりませんでした。近くの画像を検索します...`);
+    for (let i = 0; i < allImages.length; i++) {
+      const img = allImages[i];
+      const anchorRow = img.getAnchorRow();
+      const anchorCol = img.getAnchorColumn();
+
+      // 行が一致し、列が近い範囲にある画像を探す（±2列）
+      if (anchorRow === rowNumber && Math.abs(anchorCol - columnNumber) <= 2) {
+        try {
+          const blob = img.getBlob();
+          if (blob) {
+            images.push(blob);
+            console.log(`行 ${rowNumber}: 近くの画像を取得しました（列 ${anchorCol}）（${blob.getBytes().length} bytes, ${blob.getContentType()}）`);
+          }
+        } catch (error) {
+          console.warn(`行 ${rowNumber}: 近くの画像の取得に失敗しました: ${error}`);
+        }
+
+        if (images.length >= 4) {
+          break;
+        }
+      }
+    }
+  }
+
+  // 2. セルの値/数式がURLの場合（画像がまだない場合のみ）
   if (images.length === 0) {
-    const cellValue = String(sheet.getRange(rowNumber, columnNumber).getValue() || '').trim();
+    const range = sheet.getRange(rowNumber, columnNumber);
+    let cellValue = String(range.getValue() || '').trim();
+    const formula = range.getFormula();
+
+    // =IMAGE("...") 形式にも対応
+    if (!cellValue && formula) {
+      const imageFormulaMatch = formula.match(/=IMAGE\("([^"]+)"/i);
+      if (imageFormulaMatch && imageFormulaMatch[1]) {
+        cellValue = imageFormulaMatch[1];
+      }
+    }
     if (cellValue) {
       // カンマ区切りで複数URL対応
       const urls = cellValue.split(',').map(url => url.trim()).filter(url => url);
@@ -736,7 +839,7 @@ function updateAllEngagementMetrics(daysBack) {
     return;
   }
 
-  SpreadsheetApp.getUi().alert(`${targetRows.length}件のツイートのエンゲージメントを取得します。\nしばらくお待ちください...`);
+  console.log(`${targetRows.length}件のツイートのエンゲージメントを取得します...`);
 
   // 共通関数を使用してエンゲージメント更新
   const { successCount, failCount } = processEngagementUpdates_(sheet, targetRows, credentials);
@@ -866,19 +969,7 @@ function postNextScheduledToX() {
       return;
     }
 
-    const props = PropertiesService.getScriptProperties();
-    const apiKey = props.getProperty('X_API_KEY');
-    const apiSecret = props.getProperty('X_API_SECRET');
-    const accessToken = props.getProperty('X_ACCESS_TOKEN');
-    const accessTokenSecret = props.getProperty('X_ACCESS_TOKEN_SECRET');
-
-    if (!apiKey || !apiSecret || !accessToken || !accessTokenSecret) {
-      throw new Error(
-        'スクリプトプロパティ X_API_KEY / X_API_SECRET / X_ACCESS_TOKEN / X_ACCESS_TOKEN_SECRET を設定してください。'
-      );
-    }
-
-    const credentials = { apiKey, apiSecret, accessToken, accessTokenSecret };
+    const credentials = getCredentials_();
 
     // スレッドグループIDがある場合は、同じIDを持つすべての行を取得
     if (target.threadGroupId) {
@@ -1464,6 +1555,8 @@ function checkAllCharacterCounts() {
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('X自動投稿')
+    .addItem('📤 次の投稿を実行', 'postNextScheduledToX')
+    .addSeparator()
     .addItem('選択行を1つのスレッドにまとめる', 'groupSelectedRowsAsThread')
     .addItem('スレッドIDをクリア', 'clearThreadIdFromSelection')
     .addSeparator()
@@ -1471,6 +1564,9 @@ function onOpen() {
     .addSeparator()
     .addItem('エンゲージメントを更新', 'updateAllEngagementMetrics')
     .addItem('人気ツイートTOP10を表示', 'analyzeTopTweets')
+    .addSeparator()
+    .addItem('🔍 画像デバッグ情報を表示', 'debugAllImages')
+    .addItem('🔍 選択セルの画像を取得テスト', 'testGetImageFromCell')
     .addSeparator()
     .addItem('⚙️ Xプラン設定', 'showXPlanSettingsDialog')
     .addSeparator()
@@ -2034,5 +2130,122 @@ function updateSingleRowCharCount_(sheet, rowNumber) {
       charCountCell.setBackground(null);
       charCountCell.setFontColor(null);
     }
+  }
+}
+
+/**
+ * 画像デバッグ用：シート内のすべての画像情報を表示
+ * メニューから実行して画像の配置状況を確認できます
+ */
+function debugAllImages() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const allImages = sheet.getImages();
+
+  console.log(`=== 画像デバッグ情報 ===`);
+  console.log(`シート名: ${sheet.getName()}`);
+  console.log(`画像総数: ${allImages.length}`);
+  console.log('');
+
+  if (allImages.length === 0) {
+    console.log('❌ シート内に画像が見つかりません。');
+    console.log('');
+    console.log('【対処方法】');
+    console.log('1. 画像を挿入する際は「挿入 > 画像 > セル内の画像」を選択してください');
+    console.log('2. または、画像をGoogle Driveにアップロードして、C列にURLを貼り付けてください');
+    console.log('   例: https://drive.google.com/file/d/xxxxx/view');
+
+    SpreadsheetApp.getUi().alert(
+      '画像が見つかりません',
+      '画像が検出されませんでした。\n\n' +
+      '【対処方法】\n' +
+      '1. 「挿入 > 画像 > セル内の画像」で挿入\n' +
+      '2. Google DriveのURLをC列に貼り付け\n\n' +
+      'ログで詳細を確認してください。',
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+    return;
+  }
+
+  for (let i = 0; i < allImages.length; i++) {
+    const img = allImages[i];
+
+    console.log(`--- 画像 ${i + 1} ---`);
+    console.log(`  アンカー行: ${img.getAnchorRow()}`);
+    console.log(`  アンカー列: ${img.getAnchorColumn()}`);
+    console.log(`  行オフセット: ${img.getAnchorRowOffset()}`);
+    console.log(`  列オフセット: ${img.getAnchorColumnOffset()}`);
+    console.log(`  幅: ${img.getWidth()}`);
+    console.log(`  高さ: ${img.getHeight()}`);
+
+    try {
+      const blob = img.getBlob();
+      console.log(`  ファイル形式: ${blob.getContentType()}`);
+      console.log(`  ファイルサイズ: ${blob.getBytes().length} bytes`);
+    } catch (error) {
+      console.log(`  ⚠️ Blob取得エラー: ${error}`);
+    }
+    console.log('');
+  }
+
+  // 結果をダイアログでも表示
+  let message = `シート内の画像: ${allImages.length}件\n\n`;
+
+  for (let i = 0; i < Math.min(allImages.length, 10); i++) {
+    const img = allImages[i];
+    const row = img.getAnchorRow();
+    const col = img.getAnchorColumn();
+    const colLetter = String.fromCharCode(64 + col); // 1=A, 2=B, 3=C...
+
+    message += `${i + 1}. セル${colLetter}${row} (行${row}, 列${col})\n`;
+  }
+
+  if (allImages.length > 10) {
+    message += `\n... 他 ${allImages.length - 10}件\n`;
+  }
+
+  message += '\nログで詳細情報を確認してください。';
+
+  SpreadsheetApp.getUi().alert('画像デバッグ情報', message, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/**
+ * 特定のセルの画像をテスト取得
+ */
+function testGetImageFromCell() {
+  const ui = SpreadsheetApp.getUi();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const activeCell = sheet.getActiveCell();
+  const row = activeCell.getRow();
+  const col = activeCell.getColumn();
+
+  console.log(`=== セル画像取得テスト ===`);
+  console.log(`対象セル: 行${row}, 列${col}`);
+
+  // getImagesFromCell_関数を呼び出し
+  const images = getImagesFromCell_(sheet, row, col);
+
+  console.log(`取得した画像数: ${images.length}`);
+
+  if (images.length > 0) {
+    for (let i = 0; i < images.length; i++) {
+      const blob = images[i];
+      console.log(`  画像${i + 1}: ${blob.getContentType()}, ${blob.getBytes().length} bytes`);
+    }
+
+    ui.alert(
+      '✅ 画像取得成功',
+      `${images.length}枚の画像を取得しました。\n\nログで詳細を確認してください。`,
+      ui.ButtonSet.OK
+    );
+  } else {
+    ui.alert(
+      '❌ 画像取得失敗',
+      'このセルから画像を取得できませんでした。\n\n' +
+      '【対処方法】\n' +
+      '1. 「挿入 > 画像 > セル内の画像」で挿入\n' +
+      '2. Google DriveのURLを貼り付け\n\n' +
+      'ログで詳細を確認してください。',
+      ui.ButtonSet.OK
+    );
   }
 }
