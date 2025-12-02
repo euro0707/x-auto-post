@@ -111,7 +111,7 @@ const CONFIG = Object.freeze({
     daysBack: 7,                // 更新対象期間（日数）
     batchSize: 100,             // 一度に処理する件数（API制限対策）
     retryOnRateLimit: false,    // Rate Limit時にリトライするか（15分待つ必要があるためfalse推奨）
-    sleepBetweenRequests: 1000  // リクエスト間のスリープ時間（ミリ秒）※1秒間隔に変更
+    sleepBetweenRequests: 3000  // リクエスト間のスリープ時間（ミリ秒）※3秒間隔に変更（Rate Limit対策）
   }),
   // 実行制御設定
   execution: Object.freeze({
@@ -340,7 +340,7 @@ function getImagesFromCell_(sheet, rowNumber, columnNumber) {
   try {
     const cell = sheet.getRange(rowNumber, columnNumber);
     const value = cell.getValue();
-    
+
     // CellImageオブジェクトのチェック（getContentUrlメソッドの有無で判定）
     if (value && typeof value.getContentUrl === 'function') {
       const imageUrl = value.getContentUrl();
@@ -354,7 +354,7 @@ function getImagesFromCell_(sheet, rowNumber, columnNumber) {
           );
         }
       }
-    } 
+    }
     // 古い形式や互換性のため getBlob も一応チェック（通常はCellImageには存在しない）
     else if (value && typeof value.getBlob === 'function') {
       const blob = value.getBlob();
@@ -628,8 +628,18 @@ function getTweetEngagement_(tweetId, credentials) {
 
   const method = 'GET';
   const baseUrl = `${CONFIG.api.tweetLookupEndpoint}/${tweetId}`;
-  const queryParams = { 'tweet.fields': 'public_metrics' };
-  const url = `${baseUrl}?tweet.fields=public_metrics`;
+
+  // プラン設定を確認
+  const xPlan = getXPlanConfig();
+  const includePremiumMetrics = xPlan.limits.canAccessPremiumMetrics;
+
+  // 有料プランの場合は non_public_metrics も取得
+  const metricsFields = includePremiumMetrics
+    ? 'public_metrics,non_public_metrics'
+    : 'public_metrics';
+
+  const queryParams = { 'tweet.fields': metricsFields };
+  const url = `${baseUrl}?tweet.fields=${encodeURIComponent(metricsFields)}`;
 
   // OAuth 1.0a署名を生成
   const buildOAuthHeader = () => {
@@ -698,22 +708,25 @@ function getTweetEngagement_(tweetId, credentials) {
     throw new Error(`エンゲージメント取得レスポンスの解析に失敗しました: ${error}`);
   }
 
-  const metrics = parsed && parsed.data && parsed.data.public_metrics;
-  if (!metrics) {
+  const publicMetrics = parsed && parsed.data && parsed.data.public_metrics;
+  const nonPublicMetrics = parsed && parsed.data && parsed.data.non_public_metrics;
+
+  if (!publicMetrics) {
     throw new Error(`エンゲージメント取得レスポンスにpublic_metricsが含まれていません: ${body}`);
   }
 
-  // プラン設定に応じて有料指標を含めるか決定
-  const xPlan = getXPlanConfig();
-  const includePremiumMetrics = xPlan.limits.canAccessPremiumMetrics;
+  // デバッグ用ログ
+  if (includePremiumMetrics) {
+    console.log(`non_public_metrics: ${JSON.stringify(nonPublicMetrics)}`);
+  }
 
   return {
-    like_count: metrics.like_count || 0,
-    retweet_count: metrics.retweet_count || 0,
-    reply_count: metrics.reply_count || 0,
-    quote_count: metrics.quote_count || 0,
-    impression_count: includePremiumMetrics ? (metrics.impression_count || 0) : null,
-    bookmark_count: includePremiumMetrics ? (metrics.bookmark_count || 0) : null
+    like_count: publicMetrics.like_count || 0,
+    retweet_count: publicMetrics.retweet_count || 0,
+    reply_count: publicMetrics.reply_count || 0,
+    quote_count: publicMetrics.quote_count || 0,
+    impression_count: includePremiumMetrics && nonPublicMetrics ? (nonPublicMetrics.impression_count || 0) : null,
+    bookmark_count: includePremiumMetrics && publicMetrics ? (publicMetrics.bookmark_count || 0) : null
   };
 }
 
