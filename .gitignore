@@ -28,3 +28,6 @@ Thumbs.db
 # 一時ファイル
 tmp/
 temp/
+
+# 個人メモ・記事コンテンツ
+src/note_article.md
